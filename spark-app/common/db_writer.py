@@ -420,7 +420,20 @@ def refresh_marts(conn) -> None:
 def refresh_marts_cursor(cur) -> None:
     refreshed_at = datetime.utcnow()
 
-    cur.execute("DELETE FROM analytics.mart_open_orders_by_delivery_status")
+    cur.execute("SELECT pg_advisory_xact_lock(424242)")
+
+    cur.execute(
+        """
+        DELETE FROM analytics.mart_open_orders_by_delivery_status m
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM analytics.fact_orders_current f
+            WHERE f.is_open = TRUE
+              AND f.delivery_date = m.delivery_date
+              AND f.status = m.status
+        )
+        """
+    )
     cur.execute(
         """
         INSERT INTO analytics.mart_open_orders_by_delivery_status (
@@ -434,6 +447,10 @@ def refresh_marts_cursor(cur) -> None:
         FROM analytics.fact_orders_current
         WHERE is_open = TRUE
         GROUP BY delivery_date, status
+        ON CONFLICT (delivery_date, status)
+        DO UPDATE SET
+            open_orders = EXCLUDED.open_orders,
+            updated_at = EXCLUDED.updated_at
         """,
         (refreshed_at,),
     )
@@ -457,11 +474,28 @@ def refresh_marts_cursor(cur) -> None:
         ) q
         ORDER BY open_orders DESC, delivery_date ASC
         LIMIT 3
+        ON CONFLICT (rank_position)
+        DO UPDATE SET
+            delivery_date = EXCLUDED.delivery_date,
+            open_orders = EXCLUDED.open_orders,
+            updated_at = EXCLUDED.updated_at
         """,
         (refreshed_at,),
     )
 
-    cur.execute("DELETE FROM analytics.mart_open_pending_items_by_product")
+    cur.execute(
+        """
+        DELETE FROM analytics.mart_open_pending_items_by_product m
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM analytics.fact_order_items_current oi
+            INNER JOIN analytics.fact_orders_current o
+                ON o.order_id = oi.order_id
+            WHERE o.is_pending = TRUE
+              AND oi.product_id = m.product_id
+        )
+        """
+    )
     cur.execute(
         """
         INSERT INTO analytics.mart_open_pending_items_by_product (
@@ -476,6 +510,10 @@ def refresh_marts_cursor(cur) -> None:
             ON o.order_id = oi.order_id
         WHERE o.is_pending = TRUE
         GROUP BY oi.product_id
+        ON CONFLICT (product_id)
+        DO UPDATE SET
+            pending_items = EXCLUDED.pending_items,
+            updated_at = EXCLUDED.updated_at
         """,
         (refreshed_at,),
     )
@@ -499,6 +537,11 @@ def refresh_marts_cursor(cur) -> None:
         ) q
         ORDER BY pending_orders DESC, customer_id ASC
         LIMIT 3
+        ON CONFLICT (rank_position)
+        DO UPDATE SET
+            customer_id = EXCLUDED.customer_id,
+            pending_orders = EXCLUDED.pending_orders,
+            updated_at = EXCLUDED.updated_at
         """,
         (refreshed_at,),
     )
