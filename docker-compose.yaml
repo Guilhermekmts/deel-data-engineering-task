@@ -54,6 +54,18 @@ services:
     ports:
       - "8083:8083"
 
+  analytics-db:
+    image: postgres:15
+    environment:
+      - POSTGRES_USER=analytics_user
+      - POSTGRES_PASSWORD=analytics_1234
+      - POSTGRES_DB=analytics_db
+    volumes:
+      - analytics-pg-data:/var/lib/postgresql/data
+      - "${PWD}/db-scripts/initialize_analytics_ddl.sql:/docker-entrypoint-initdb.d/initialize_analytics_ddl.sql"
+    ports:
+      - "5433:5432"
+
   debezium-init:
     image: curlimages/curl:latest
     depends_on:
@@ -64,5 +76,34 @@ services:
     entrypoint: ["/bin/sh", "/init-connectors.sh"]
     restart: "no"
 
+  spark:
+    build:
+      context: .
+      dockerfile: ./docker/spark/Dockerfile
+    depends_on:
+      - kafka
+      - transactions-db
+      - analytics-db
+    working_dir: /workspace
+    volumes:
+      - "${PWD}:/workspace"
+      - "${PWD}/.spark-checkpoints:/workspace/.spark-checkpoints"
+    environment:
+      - SPARK_MODE=client
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - SOURCE_DB_HOST=transactions-db
+      - SOURCE_DB_PORT=5432
+      - SOURCE_DB_NAME=finance_db
+      - SOURCE_DB_USER=finance_db_user
+      - SOURCE_DB_PASSWORD=1234
+      - TARGET_DB_HOST=analytics-db
+      - TARGET_DB_PORT=5432
+      - TARGET_DB_NAME=analytics_db
+      - TARGET_DB_USER=analytics_user
+      - TARGET_DB_PASSWORD=analytics_1234
+      - CHECKPOINT_ROOT=/workspace/.spark-checkpoints
+    command: ["sleep", "infinity"]
+
 volumes:
   pg-data:
+  analytics-pg-data:
