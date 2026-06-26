@@ -2,3 +2,4 @@ db-data/
 .spark-checkpoints/
 __pycache__/
 *.pyc
+data/

@@ -88,6 +88,9 @@ services:
     volumes:
       - "${PWD}:/workspace"
       - "${PWD}/.spark-checkpoints:/workspace/.spark-checkpoints"
+      - "${PWD}/data/delta:/workspace/data/delta"
+    ports:
+      - "8888:8888"
     environment:
       - SPARK_MODE=client
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
@@ -102,6 +105,7 @@ services:
       - TARGET_DB_USER=analytics_user
       - TARGET_DB_PASSWORD=analytics_1234
       - CHECKPOINT_ROOT=/workspace/.spark-checkpoints
+      - DELTA_ROOT=/workspace/data/delta
     command: ["sleep", "infinity"]
 
 volumes:

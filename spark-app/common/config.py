@@ -1,13 +1,6 @@
 import os
 
 
-def _required(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise ValueError(f"Missing required environment variable: {name}")
-    return value
-
-
 class Settings:
     kafka_bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 
@@ -24,6 +17,26 @@ class Settings:
     target_db_password = os.getenv("TARGET_DB_PASSWORD", "analytics_1234")
 
     checkpoint_root = os.getenv("CHECKPOINT_ROOT", "/workspace/.spark-checkpoints")
+    delta_root = os.getenv("DELTA_ROOT", "/workspace/data/delta")
+
+    target_jdbc_batchsize = int(os.getenv("TARGET_JDBC_BATCHSIZE", "10000"))
+    target_jdbc_num_partitions = int(os.getenv("TARGET_JDBC_NUM_PARTITIONS", "4"))
+
+    @classmethod
+    def silver_customers_path(cls) -> str:
+        return f"{cls.delta_root}/silver_customers"
+
+    @classmethod
+    def silver_products_path(cls) -> str:
+        return f"{cls.delta_root}/silver_products"
+
+    @classmethod
+    def silver_orders_path(cls) -> str:
+        return f"{cls.delta_root}/silver_orders"
+
+    @classmethod
+    def silver_order_items_path(cls) -> str:
+        return f"{cls.delta_root}/silver_order_items"
 
     @classmethod
     def source_jdbc_url(cls) -> str:
@@ -33,6 +46,3 @@ class Settings:
     def target_jdbc_url(cls) -> str:
         return f"jdbc:postgresql://{cls.target_db_host}:{cls.target_db_port}/{cls.target_db_name}"
 
-    @classmethod
-    def validate(cls) -> None:
-        _required("KAFKA_BOOTSTRAP_SERVERS")
