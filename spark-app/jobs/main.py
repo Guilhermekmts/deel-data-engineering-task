@@ -12,12 +12,10 @@ if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
 from common.delta_manager import (
-    _delta_exists,
     ensure_silver_tables,
     process_stream_batch,
 )
 from common.config import Settings
-from delta.tables import DeltaTable
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, date_add, get_json_object, lit, to_timestamp, when
 from pyspark.sql.types import (
@@ -52,7 +50,7 @@ def normalize_customers(df: DataFrame) -> DataFrame:
             to_timestamp((_coalesce_before_after("$.before.updated_at", "$.after.updated_at").cast("long") / 1000)).alias("updated_at"),
             to_timestamp((_coalesce_before_after("$.before.created_at", "$.after.created_at").cast("long") / 1000)).alias("created_at"),
             to_timestamp((_json("$.ts_ms") / 1000).cast("double")).alias("event_ts"),
-            _json("$.source.ts_ms").alias("source_ts_ms"),
+            _json("$.source.ts_ms").cast("long").alias("source_ts_ms"),
             _json("$.source.lsn").cast("long").alias("source_lsn"),
             col("kafka_partition").cast("int").alias("kafka_partition"),
             col("kafka_offset").cast("long").alias("kafka_offset"),
@@ -76,7 +74,7 @@ def normalize_products(df: DataFrame) -> DataFrame:
             to_timestamp((_coalesce_before_after("$.before.updated_at", "$.after.updated_at").cast("long") / 1000)).alias("updated_at"),
             to_timestamp((_coalesce_before_after("$.before.created_at", "$.after.created_at").cast("long") / 1000)).alias("created_at"),
             to_timestamp((_json("$.ts_ms") / 1000).cast("double")).alias("event_ts"),
-            _json("$.source.ts_ms").alias("source_ts_ms"),
+            _json("$.source.ts_ms").cast("long").alias("source_ts_ms"),
             _json("$.source.lsn").cast("long").alias("source_lsn"),
             col("kafka_partition").cast("int").alias("kafka_partition"),
             col("kafka_offset").cast("long").alias("kafka_offset"),
@@ -106,7 +104,7 @@ def normalize_orders(df: DataFrame) -> DataFrame:
             to_timestamp((_coalesce_before_after("$.before.updated_at", "$.after.updated_at").cast("long") / 1000)).alias("updated_at"),
             to_timestamp((_coalesce_before_after("$.before.created_at", "$.after.created_at").cast("long") / 1000)).alias("created_at"),
             to_timestamp((_json("$.ts_ms") / 1000).cast("double")).alias("event_ts"),
-            _json("$.source.ts_ms").alias("source_ts_ms"),
+            _json("$.source.ts_ms").cast("long").alias("source_ts_ms"),
             _json("$.source.lsn").cast("long").alias("source_lsn"),
             col("kafka_partition").cast("int").alias("kafka_partition"),
             col("kafka_offset").cast("long").alias("kafka_offset"),
@@ -129,7 +127,7 @@ def normalize_order_items(df: DataFrame) -> DataFrame:
             to_timestamp((_coalesce_before_after("$.before.updated_at", "$.after.updated_at").cast("long") / 1000)).alias("updated_at"),
             to_timestamp((_coalesce_before_after("$.before.created_at", "$.after.created_at").cast("long") / 1000)).alias("created_at"),
             to_timestamp((_json("$.ts_ms") / 1000).cast("double")).alias("event_ts"),
-            _json("$.source.ts_ms").alias("source_ts_ms"),
+            _json("$.source.ts_ms").cast("long").alias("source_ts_ms"),
             _json("$.source.lsn").cast("long").alias("source_lsn"),
             col("kafka_partition").cast("int").alias("kafka_partition"),
             col("kafka_offset").cast("long").alias("kafka_offset"),
@@ -240,12 +238,7 @@ def bootstrap_with_spark(spark: SparkSession) -> None:
     order_items = order_items.select([f.name for f in SILVER_ORDER_ITEM_SCHEMA.fields])
 
     def merge_or_init(df: DataFrame, key_col: str, path: str) -> None:
-        if _delta_exists(spark, path):
-            DeltaTable.forPath(spark, path).alias("target").merge(
-                df.alias("source"), f"target.{key_col} = source.{key_col}"
-            ).whenNotMatchedInsertAll().execute()
-        else:
-            df.write.format("delta").mode("overwrite").save(path)
+        df.write.format("delta").mode("append").save(path)
 
     merge_or_init(customers, "customer_id", Settings.silver_customers_path())
     merge_or_init(products, "product_id", Settings.silver_products_path())

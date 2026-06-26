@@ -59,50 +59,16 @@ def db_connection(host: str, port: str, dbname: str, user: str, password: str):
         conn.close()
 
 
-def dedupe_batch_by_key(df: DataFrame, key_col: str) -> DataFrame:
-    """Keep only the latest row per key inside one micro-batch."""
+def dedupe_batch_by_event(df: DataFrame) -> DataFrame:
+    """Remove duplicate events within a micro-batch using (kafka_partition, kafka_offset) as unique event ID."""
     if df.rdd.isEmpty():
         return df
-    w = Window.partitionBy(key_col).orderBy(
-        col("source_lsn").desc_nulls_last(),
-        col("source_ts_ms").desc_nulls_last(),
-        col("kafka_offset").desc_nulls_last(),
-    )
-    return df.withColumn("_rn", row_number().over(w)).where(col("_rn") == 1).drop("_rn")
+    return df.dropDuplicates(["kafka_partition", "kafka_offset"])
 
 
-def _ordering_condition(prefix: str = "source", target_prefix: str = "target") -> str:
-    """Return a SQL merge condition that is true when source is newer than target."""
-    s_lsn = f"COALESCE({prefix}.source_lsn, -1)"
-    t_lsn = f"COALESCE({target_prefix}.source_lsn, -1)"
-    s_ts = f"COALESCE({prefix}.source_ts_ms, -1)"
-    t_ts = f"COALESCE({target_prefix}.source_ts_ms, -1)"
-    s_off = f"COALESCE({prefix}.kafka_offset, -1)"
-    t_off = f"COALESCE({target_prefix}.kafka_offset, -1)"
-    return (
-        f"({s_lsn} > {t_lsn} OR "
-        f"({s_lsn} = {t_lsn} AND {s_ts} > {t_ts}) OR "
-        f"({s_lsn} = {t_lsn} AND {s_ts} = {t_ts} AND {s_off} > {t_off}))"
-    )
-
-
-def merge_into_delta(spark: SparkSession, delta_path: str, key_col: str, df: DataFrame) -> None:
-    """Merge a micro-batch into a Delta silver table using the CDC ordering key."""
-    if _delta_exists(spark, delta_path):
-        dt = DeltaTable.forPath(spark, delta_path)
-        ordering = _ordering_condition("source", "target")
-        condition = f"target.{key_col} = source.{key_col}"
-        (
-            dt.alias("target")
-            .merge(df.alias("source"), condition)
-            .whenMatchedDelete(condition=f"source.op = 'd' AND {ordering}")
-            .whenMatchedUpdateAll(condition=ordering)
-            .whenNotMatchedInsertAll(condition="source.op <> 'd'")
-            .execute()
-        )
-    else:
-        # First batch creates the table.
-        df.where(col("op") != "d").write.format("delta").mode("overwrite").save(delta_path)
+def append_to_delta(delta_path: str, df: DataFrame) -> None:
+    """Append a micro-batch to a Delta silver table (append-only CDC log)."""
+    df.write.format("delta").mode("append").save(delta_path)
 
 
 def _delta_exists(spark: SparkSession, path: str) -> bool:
@@ -209,24 +175,50 @@ SILVER_ORDER_ITEM_SCHEMA = StructType(
 )
 
 
+def _latest_by_key(df: DataFrame, key_col: str) -> DataFrame:
+    """Pick the latest row per business key from the append-only CDC log."""
+    w = Window.partitionBy(key_col).orderBy(
+        col("source_lsn").desc_nulls_last(),
+        col("source_ts_ms").desc_nulls_last(),
+        col("kafka_offset").desc_nulls_last(),
+    )
+    return (
+        df.withColumn("_rn", row_number().over(w))
+        .where(col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
 def compute_dimensions_and_facts(spark: SparkSession) -> dict[str, DataFrame]:
     """Read all silver Delta tables and compute the final fact/dim DataFrames."""
-    customers = read_silver(spark, Settings.silver_customers_path()).select(
-        "customer_id", "customer_name", "is_active", "customer_address", "updated_at", "created_at"
+    customers = (
+        _latest_by_key(read_silver(spark, Settings.silver_customers_path()), "customer_id")
+        .where(col("op") != "d")
+        .select(
+            "customer_id", "customer_name", "is_active", "customer_address", "updated_at", "created_at"
+        )
     )
 
-    products = read_silver(spark, Settings.silver_products_path()).select(
-        "product_id", "product_name", "barcode", "unity_price", "is_active", "updated_at", "created_at"
+    products = (
+        _latest_by_key(read_silver(spark, Settings.silver_products_path()), "product_id")
+        .where(col("op") != "d")
+        .select(
+            "product_id", "product_name", "barcode", "unity_price", "is_active", "updated_at", "created_at"
+        )
     )
 
-    orders = read_silver(spark, Settings.silver_orders_path()).select(
-        "order_id",
-        "customer_id",
-        "order_date",
-        "delivery_date",
-        "status",
-        "updated_at",
-        "created_at",
+    orders = (
+        _latest_by_key(read_silver(spark, Settings.silver_orders_path()), "order_id")
+        .where(col("op") != "d")
+        .select(
+            "order_id",
+            "customer_id",
+            "order_date",
+            "delivery_date",
+            "status",
+            "updated_at",
+            "created_at",
+        )
     )
     orders = orders.withColumn(
         "is_open",
@@ -241,8 +233,12 @@ def compute_dimensions_and_facts(spark: SparkSession) -> dict[str, DataFrame]:
         col("status").isin("PENDING", "PROCESSING", "REPROCESSING"),
     )
 
-    order_items = read_silver(spark, Settings.silver_order_items_path()).select(
-        "order_item_id", "order_id", "product_id", "quantity", "updated_at", "created_at"
+    order_items = (
+        _latest_by_key(read_silver(spark, Settings.silver_order_items_path()), "order_item_id")
+        .where(col("op") != "d")
+        .select(
+            "order_item_id", "order_id", "product_id", "quantity", "updated_at", "created_at"
+        )
     )
 
     return {
@@ -272,7 +268,7 @@ def compute_marts(facts: dict[str, DataFrame]) -> dict[str, DataFrame]:
         .orderBy(col("open_orders").desc(), col("delivery_date").asc())
         .limit(3)
     )
-    top3_delivery = top3_delivery.withColumn(
+    top3_delivery = top3_delivery.coalesce(1).withColumn(
         "rank_position", row_number().over(Window.orderBy(col("open_orders").desc(), col("delivery_date").asc()))
     ).select("rank_position", "delivery_date", "open_orders")
 
@@ -295,7 +291,7 @@ def compute_marts(facts: dict[str, DataFrame]) -> dict[str, DataFrame]:
         pending_orders_customers.orderBy(col("pending_orders").desc(), col("customer_id").asc())
         .limit(3)
     )
-    top3_customers = top3_customers.withColumn(
+    top3_customers = top3_customers.coalesce(1).withColumn(
         "rank_position",
         row_number().over(Window.orderBy(col("pending_orders").desc(), col("customer_id").asc())),
     ).select("rank_position", "customer_id", "pending_orders")
@@ -388,7 +384,7 @@ def process_stream_batch(
     key_col: str,
     delta_path: str,
 ) -> None:
-    """Process one micro-batch: dedupe, merge into Delta silver, refresh Postgres final layer."""
+    """Process one micro-batch: dedupe by event ID, append to Delta silver, refresh Postgres final layer."""
     LOGGER.info("[%s:%s] received batch with %s row(s)", stream_name, batch_id, batch_df.count())
     if _batch_is_empty(batch_df):
         LOGGER.info("[%s:%s] empty batch; skipping", stream_name, batch_id)
@@ -404,9 +400,9 @@ def process_stream_batch(
     if _batch_is_empty(df):
         return
 
-    df = dedupe_batch_by_key(df, key_col)
-    merge_into_delta(spark, delta_path, key_col, df)
-    LOGGER.info("[%s:%s] merged into Delta %s", stream_name, batch_id, delta_path)
+    df = dedupe_batch_by_event(df)
+    append_to_delta(delta_path, df)
+    LOGGER.info("[%s:%s] appended %s row(s) to Delta %s", stream_name, batch_id, df.count(), delta_path)
 
     refresh_analytics_final_layer(spark, df, stream_name)
 
