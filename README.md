@@ -262,6 +262,9 @@ docker compose run --rm debezium-init
 # 5. (Optional) start the PySpark notebook
 ./scripts/start_notebook.sh
 # Open http://localhost:8888/?token=deel
+
+# 6. (Optional) open the Streamlit dashboard
+# Open http://localhost:8501
 ```
 
 The Spark `run_pipeline.sh` command uses `--packages` to download the required
