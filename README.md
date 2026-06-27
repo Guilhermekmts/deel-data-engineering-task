@@ -102,6 +102,39 @@ guarantees that **late or replayed CDC events never overwrite newer state**.
 
 ![Database Diagram](images/database-diagram.png)
 
+## Quick start
+
+```bash
+# 1. Build and start the stack
+docker compose up -d --build
+
+# 2. Register the Debezium connector
+docker compose run --rm debezium-init
+
+# 3. Run the streaming pipeline
+./scripts/run_pipeline.sh
+
+# 4. (Optional) query metrics
+./scripts/query_metrics.sh open_orders_by_delivery_status
+./scripts/query_metrics.sh top3_delivery_dates
+./scripts/query_metrics.sh pending_items_by_product
+./scripts/query_metrics.sh top3_customers_pending_orders
+
+# 5. (Optional) start the PySpark notebook
+./scripts/start_notebook.sh
+# Open http://localhost:8888/?token=deel
+
+# 6. (Optional) open the Streamlit dashboard
+# Open http://localhost:8501
+```
+
+The Spark `run_pipeline.sh` command uses `--packages` to download the required
+JVM connectors (Kafka, Delta, Postgres JDBC) at runtime. The first run may take
+a few minutes to fetch them; they are cached in `/tmp/ivy-cache` inside the
+container.
+
+`run_pipeline.sh` pre-creates Kafka topics so Spark and Debezium never race.
+
 ---
 
 ## End-to-End Pipeline Flow
@@ -240,39 +273,6 @@ Each table also carries its domain columns (e.g., `customer_id`, `customer_name`
 ![Fact and Dimension Tables](images/fact_dim_data.png)
 
 ---
-
-## Quick start
-
-```bash
-# 1. Build and start the stack
-docker compose up -d --build
-
-# 2. Register the Debezium connector
-docker compose run --rm debezium-init
-
-# 3. Run the streaming pipeline
-./scripts/run_pipeline.sh
-
-# 4. (Optional) query metrics
-./scripts/query_metrics.sh open_orders_by_delivery_status
-./scripts/query_metrics.sh top3_delivery_dates
-./scripts/query_metrics.sh pending_items_by_product
-./scripts/query_metrics.sh top3_customers_pending_orders
-
-# 5. (Optional) start the PySpark notebook
-./scripts/start_notebook.sh
-# Open http://localhost:8888/?token=deel
-
-# 6. (Optional) open the Streamlit dashboard
-# Open http://localhost:8501
-```
-
-The Spark `run_pipeline.sh` command uses `--packages` to download the required
-JVM connectors (Kafka, Delta, Postgres JDBC) at runtime. The first run may take
-a few minutes to fetch them; they are cached in `/tmp/ivy-cache` inside the
-container.
-
-`run_pipeline.sh` pre-creates Kafka topics so Spark and Debezium never race.
 
 ## Streaming semantics
 
