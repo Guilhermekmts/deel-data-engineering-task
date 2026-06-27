@@ -1,273 +1,407 @@
-## DEEL Spark Take-Home - Online Analytics Pipeline
+# DEEL Spark Take-Home — Online Analytics Pipeline
 
-This repository now contains a full Dockerized baseline for the DEEL Spark take-home assignment, including:
+This project implements a **CDC-driven real-time analytics pipeline**. All
+processing — dimensions, facts, and operational marts — is computed inside
+**Apache Spark** and only the final serving layer is persisted in **Postgres**.
 
-- Source transactional database (`transactions-db`)
-- Debezium CDC into Kafka
-- Spark Structured Streaming app running in Docker with mounted project volume
-- Destination analytics database (`analytics-db`)
-- Dimensional and mart tables for required business metrics
+A **Jupyter PySpark notebook** is included inside the Spark container for
+interactive exploration of both CDC streams and the final analytics tables.
+
+---
 
 ## Architecture
 
-```text
-operations.* (Postgres)
-    │
-    │ Debezium CDC
-    ▼
-Kafka topics (finance_db.operations.*)
-    │
-    │ Spark Structured Streaming
-    ▼
-Delta silver tables (partitionBy event_date, CDF enabled)
-    │
-    │ CDF stream (change data feed)
-    ▼
-Delta current/* tables (one row per entity, Z-order on entity_id)
-    │
-    │ Spark SQL / DataFrame computation
-    ▼
-Postgres analytics tables (dim/fact/mart)
-    │
-    │ JDBC
-    ▼
-PySpark notebook
+```mermaid
+flowchart TB
+    subgraph Source["Transaction System (Postgres)"]
+        PG[(finance_db.operations\ncustomers / products\norders / order_items)]
+        CRON["pg_cron Jobs\n(mutate data every 1-2 min)"]
+        WAL["WAL (Write-Ahead Log)\nwal_level=logical"]
+    end
 
-Delta ops layer (data/delta/ops/):
-  processed_offsets          per-batch, per-partition consumed offset
-  cdc_slot_progress          Debezium vs Postgres WAL LSN
-  kafka_topic_high_water     Kafka end-offset per (topic, partition)
-  recovery_audit             recovery-mode execution events
-  recovery_runbook_state     last-known-good checkpoint per stream
-  reconciliation_audit       aggregate-count checks (source vs target)
-  batch_metrics              inputRows/lateRows/dedupedRows per batch
-  snapshot_registry          hourly compact-state snapshot metadata
+    subgraph CDC["Change Data Capture"]
+        DEBEZIUM["Debezium Connector\n(PostgresConnector 2.4)"]
+        SLOT["Replication Slot\ncdc_pgoutput"]
+        PUB["Publication\ncdc_publication"]
+    end
+
+    subgraph STREAMING["Event Streaming"]
+        KAFKA["Kafka 7.5\n4 Topics:\nfinance_db.operations.*"]
+        ZK["Zookeeper"]
+    end
+
+    subgraph PROCESSING["Spark Structured Streaming"]
+        BS["Bootstrap\n(JDBC initial load)"]
+        NORM["Normalizer\n(JSON parsing, date/timestamp\ncoercion, before/after coalesce)"]
+        DEDUP["Deduplicator\n(kafka_partition, kafka_offset)"]
+        DELTA_APPEND["Delta Append\n(append-only CDC log)"]
+        LBY["Latest-By-Key\nWindow: source_lsn DESC\nsource_ts_ms DESC\nkafka_offset DESC"]
+        DIM_FACT["Dimensions & Facts\nCompute"]
+        MARTS["Operational Marts\nCompute"]
+    end
+
+    subgraph STORAGE["Delta Lake (Silver Layer)"]
+        S_CUST[(silver_customers)]
+        S_PROD[(silver_products)]
+        S_ORD[(silver_orders)]
+        S_ITEMS[(silver_order_items)]
+    end
+
+    subgraph ANALYTICS["Postgres Analytics (Serving Layer)"]
+        DIM_CUST[(dim_customers)]
+        DIM_PROD[(dim_products)]
+        FACT_ORD[(fact_orders_current)]
+        FACT_ITEMS[(fact_order_items_current)]
+        M1[(mart_open_orders_by_delivery_status)]
+        M2[(mart_top3_delivery_dates_open_orders)]
+        M3[(mart_open_pending_items_by_product)]
+        M4[(mart_top3_customers_pending_orders)]
+        WM[(pipeline_watermark)]
+        RA[(reconciliation_audit)]
+    end
+
+    subgraph EXPLORATION["Interactive"]
+        NB["Jupyter Notebook\n(PySpark exploration)"]
+        Q["CLI Queries\n(scripts/query_metrics.sh)"]
+    end
+
+    PG --> WAL
+    CRON --> PG
+    WAL --> SLOT
+    SLOT --> DEBEZIUM
+    PUB --> DEBEZIUM
+    DEBEZIUM --> KAFKA
+    ZK --> KAFKA
+    KAFKA --> NORM
+    PG --> BS
+    BS --> DELTA_APPEND
+    NORM --> DEDUP
+    DEDUP --> DELTA_APPEND
+    DELTA_APPEND --> STORAGE
+    STORAGE --> LBY
+    LBY --> DIM_FACT
+    DIM_FACT --> |"filter op != 'd'"| DIM_CUST
+    DIM_FACT --> |"filter op != 'd'"| DIM_PROD
+    DIM_FACT --> |"filter op != 'd', is_open/is_pending"| FACT_ORD
+    DIM_FACT --> |"filter op != 'd'"| FACT_ITEMS
+    DIM_FACT --> MARTS
+    MARTS --> M1 & M2 & M3 & M4
+    DIM_CUST & DIM_PROD & FACT_ORD & FACT_ITEMS --> WM
+    M1 & M2 & M3 & M4 & DIM_CUST & DIM_PROD & FACT_ORD & FACT_ITEMS --> ANALYTICS
+    ANALYTICS --> NB
+    ANALYTICS --> Q
 ```
 
-1. `operations.*` tables in source Postgres (`transactions-db`)
-2. Debezium connector publishes CDC events to Kafka topics
-3. Spark Structured Streaming consumes topics and applies CDC logic
-4. Spark upserts dimensional/fact tables into `analytics-db`
-5. Spark refreshes mart tables used for required operational metrics
-6. Metrics are queried with helper scripts
+### Why Delta?
 
-Main topics consumed:
+Delta Lake provides ACID merge semantics so each micro-batch can safely upsert
+the latest CDC state.  The ordering key `source_lsn > source_ts_ms > kafka_offset`
+guarantees that **late or replayed CDC events never overwrite newer state**.
 
-- `finance_db.operations.customers`
-- `finance_db.operations.products`
-- `finance_db.operations.orders`
-- `finance_db.operations.order_items`
+---
 
-## Repository Additions
+## End-to-End Pipeline Flow
 
-- `docker-compose.yaml`: added `analytics-db` and `spark` services
-- `docker/spark/Dockerfile`: Spark runtime image
-- `db-scripts/initialize_analytics_ddl.sql`: analytics schema DDL
-- `spark-app/jobs/main.py`: streaming pipeline entrypoint
-- `spark-app/common/config.py`: runtime settings
-- `spark-app/common/db_writer.py`: upserts, history writes, mart refreshes
-- `spark-app/sql/metrics.sql`: required metric queries
-- `scripts/run_pipeline.sh`: runs Spark job
-- `scripts/query_metrics.sh`: queries metrics from `analytics-db`
+### Step 1 — Infrastructure Startup
 
-## Dimensional and Fact Model
+| Action | Component | Detail |
+|---|---|---|
+| Start all services | `docker compose up -d --build` | 7 containers: transactions-db, zookeeper, kafka, kafka-connect, analytics-db, debezium-init, spark |
+| Source DB initializes | `transactions-db` | Creates `operations` schema with 4 tables; sets `wal_level=logical`; creates replication slot `cdc_pgoutput`; creates publication `cdc_publication`; creates CDC user with replication privileges |
+| Seed data loaded | `transactions-db` | Inserts 5 customers, 30 products, 10 orders (~250 order items) via stored procedures |
+| Cron jobs scheduled | `transactions-db` (pg_cron) | `update_customers(5)` every 2 min, `update_products(10)` every 2 min, `generate_orders(100)` every 1 min |
+| Analytics DB initializes | `analytics-db` | Creates `analytics` schema with 10 tables (4 dim/fact, 4 marts, 2 ops) + indexes |
+| Spark container waits | `spark` | Runs `sleep infinity`, ready for `spark-submit` |
 
-Schema: `analytics`
+### Step 2 — Debezium Connector Registration
 
-Dimensions:
+| Action | Component | Detail |
+|---|---|---|
+| Register connector | `debezium-init` (one-shot) | POSTs `finance-db-connector.json` to Kafka Connect API at `kafka-connect:8083` |
+| Connector config | Debezium PostgresConnector 2.4 | Host: transactions-db, DB: finance_db, user: cdc_user, slot: cdc_pgoutput, plugin: pgoutput, heartbeat: 10s |
+| Topic creation | Kafka | 4 topics auto-created: `finance_db.operations.{customers,products,orders,order_items}` |
+| CDC streaming begins | Debezium → Kafka | Every write to `operations.*` tables generates a CDC event with op (c/u/d), before/after images, source.ts_ms, source.lsn |
 
-- `dim_customers`
-- `dim_products`
+### Step 3 — Pipeline Bootstrap
 
-Facts:
+| Action | Component | Detail |
+|---|---|---|
+| Pre-create topics | `run_pipeline.sh` | `kafka-topics --create` for all 4 topics (1 partition, RF=1) |
+| Spark session created | `main.py` | App name: `deel-spark-cdc-pipeline`, Delta extensions enabled, 4 shuffle partitions |
+| Empty Delta tables ensured | `ensure_silver_tables()` | Creates 4 Delta tables with predefined schemas if they don't exist |
+| Bootstrap: JDBC read | `bootstrap_with_spark()` | Reads all 4 tables from source Postgres via Spark JDBC |
+| Bootstrap: cast & enrich | `bootstrap_with_spark()` | Renames `quanity`→`quantity`, casts `unity_price` to `decimal(18,2)`, adds `op='r'`, null CDC metadata fields |
+| Bootstrap: write to Delta | `merge_or_init()` | Appends initial snapshot to each silver Delta table |
 
-- `fact_orders_current` (latest order state)
-- `fact_order_items_current` (latest order item state)
-- `fact_orders_history` (append-only order change history)
-- `fact_order_items_history` (append-only order item change history)
+### Step 4 — Continuous Streaming (repeats every 10 seconds)
 
-Marts:
+| Action | Component | Detail |
+|---|---|---|
+| Read Kafka topic | `topic_stream()` | 4 independent streams: `startingOffsets=earliest`, `failOnDataLoss=false` |
+| Normalize CDC JSON | `normalize_*()` functions | Extracts op, before/after fields, timestamps, LSN, partition, offset from Debezium envelope |
+| Coalesce before/after | `_coalesce_before_after()` | Uses `before` values on delete (op='d'), `after` values otherwise |
+| Handle date types | `normalize_orders()` | Converts epoch-day integers via `date_add(lit("1970-01-01"), days)` |
+| Handle timestamp types | `to_timestamp(millis / 1000)` | Converts epoch millis to Spark TimestampType |
+| Filter valid ops | `.where(op.isin("c","u","d","r"))` | Drops rows with null key or invalid op |
+| Process micro-batch | `process_stream_batch()` | Calls dedupe, append, and refresh in sequence |
+| Deduplicate | `dedupe_batch_by_event()` | Removes rows with duplicate `(kafka_partition, kafka_offset)` within batch |
+| Append to Delta | `append_to_delta()` | Append-only write to silver table (audit log preserved forever) |
+| Refresh analytics | `refresh_analytics_final_layer()` | Full recompute of dims/facts/marts + Postgres write |
 
-- `mart_open_orders_by_delivery_status`
-- `mart_top3_delivery_dates_open_orders`
-- `mart_open_pending_items_by_product`
-- `mart_top3_customers_pending_orders`
+### Step 5 — Analytics Materialization (inside `refresh_analytics_final_layer`)
 
-## Open/Pending Logic
+| Action | Detail |
+|---|---|
+| Read all 4 silver tables | `read_silver()` — reads full Delta table |
+| Compute latest-by-key | `_latest_by_key()` — window function: `partitionBy(key_col) orderBy(source_lsn DESC, source_ts_ms DESC, kafka_offset DESC)`, pick row_number=1 |
+| Filter deletes | `.where(col("op") != "d")` — exclude deleted entities |
+| Compute dimensions | `dim_customers`: 6 columns; `dim_products`: 7 columns |
+| Compute facts | `fact_orders_current`: with computed `is_open` (status != COMPLETED) and `is_pending` (IN status PENDING/PROCESSING/REPROCESSING); `fact_order_items_current`: 6 columns |
+| Compute marts | `mart_open_orders_by_delivery_status`: group by delivery_date + status; `mart_top3_delivery_dates_open_orders`: top 3 by sum; `mart_open_pending_items_by_product`: sum quantity for pending orders; `mart_top3_customers_pending_orders`: top 3 by pending count |
+| Acquire advisory lock | `pg_advisory_xact_lock(424242)` — prevents concurrent stream race condition |
+| Write all 8 tables | `write_final_table()` — JDBC overwrite with TRUNCATE + INSERT (preserves DDL) |
+| Upsert watermark | `_upsert_watermark()` — per-partition max LSN/offset with ordering guard |
 
-- `is_open`: `status != 'COMPLETED'`
-- `is_pending`: `status in ('PENDING', 'PROCESSING', 'REPROCESSING')`
+### Step 6 — Querying & Exploration
 
-This logic is implemented in `spark-app/common/db_writer.py` and can be adjusted if needed.
+| Action | Tool |
+|---|---|
+| Query any mart | `./scripts/query_metrics.sh {metric_name}` — runs parameterized SQL via psql |
+| Interactive notebook | `./scripts/start_notebook.sh` — Jupyter at `localhost:8888?token=deel` |
+| Full reset | `./scripts/reset.sh` — `docker compose down -v`, removes checkpoints/Delta, rebuilds, restarts |
 
-## Prerequisites
+---
 
-- Docker + Docker Compose available locally
-- Internet access for Docker image pulls and Spark package download on first run
+## Data Model
 
-## Run
+### Source Layer — Postgres `operations` Schema
 
-From repository root:
+| Table | Columns | PK | CDC Config |
+|---|---|---|---|
+| `operations.customers` | `customer_id`, `customer_name`, `is_active`, `customer_address`, `updated_at`, `updated_by`, `created_at`, `created_by` | `customer_id` (BIGSERIAL) | REPLICA IDENTITY FULL |
+| `operations.products` | `product_id`, `product_name`, `barcode`, `unity_price`, `is_active`, `updated_at`, `updated_by`, `created_at`, `created_by` | `product_id` (BIGSERIAL) | REPLICA IDENTITY FULL |
+| `operations.orders` | `order_id`, `order_date`, `delivery_date`, `customer_id`, `status`, `updated_at`, `updated_by`, `created_at`, `created_by` | `order_id` (BIGSERIAL) | REPLICA IDENTITY FULL |
+| `operations.order_items` | `order_item_id`, `order_id`, `product_id`, `quanity`, `updated_at`, `updated_by`, `created_at`, `created_by` | `order_item_id` (BIGSERIAL) | REPLICA IDENTITY FULL |
 
-1. Build and start stack
+### Silver Layer — Delta Lake (Append-Only CDC Log)
+
+Common CDC metadata columns appended to every silver table:
+
+| Column | Type | Description |
+|---|---|---|
+| `op` | String | CDC operation: `c` (create), `u` (update), `d` (delete), `r` (bootstrap read) |
+| `event_ts` | Timestamp | Debezium event timestamp (from `$.ts_ms`) |
+| `source_ts_ms` | Long | Source DB commit timestamp (from `$.source.ts_ms`) |
+| `source_lsn` | Long | Postgres WAL Log Sequence Number (monotonic, from `$.source.lsn`) |
+| `kafka_topic` | String | Source Kafka topic name |
+| `kafka_partition` | Integer | Kafka partition number |
+| `kafka_offset` | Long | Kafka offset within partition |
+
+Each table also carries its domain columns (e.g., `customer_id`, `customer_name`, etc.).
+
+### Serving Layer — Postgres `analytics` Schema
+
+#### Dimension Tables
+
+| Table | Columns | PK | Description |
+|---|---|---|---|
+| `dim_customers` | `customer_id`, `customer_name`, `is_active`, `customer_address`, `updated_at`, `created_at` | `customer_id` | Current-state customer attributes |
+| `dim_products` | `product_id`, `product_name`, `barcode`, `unity_price`, `is_active`, `updated_at`, `created_at` | `product_id` | Current-state product attributes |
+
+#### Fact Tables
+
+| Table | Columns | PK | Description |
+|---|---|---|---|
+| `fact_orders_current` | `order_id`, `customer_id`, `order_date`, `delivery_date`, `status`, `updated_at`, `created_at`, `is_open`, `is_pending` | `order_id` | Latest state per order; `is_open` = status != COMPLETED; `is_pending` = status IN (PENDING, PROCESSING, REPROCESSING) |
+| `fact_order_items_current` | `order_item_id`, `order_id`, `product_id`, `quantity`, `updated_at`, `created_at` | `order_item_id` | Latest state per order item |
+
+#### Operational Marts
+
+| Table | Columns | PK | Business Question Answered |
+|---|---|---|---|
+| `mart_open_orders_by_delivery_status` | `delivery_date`, `status`, `open_orders`, `updated_at` | `(delivery_date, status)` | How many open orders exist per delivery date and status? |
+| `mart_top3_delivery_dates_open_orders` | `rank_position`, `delivery_date`, `open_orders`, `updated_at` | `rank_position` | Which 3 delivery dates have the most open orders? |
+| `mart_open_pending_items_by_product` | `product_id`, `pending_items`, `updated_at` | `product_id` | For pending orders, how many total items are ordered per product? |
+| `mart_top3_customers_pending_orders` | `rank_position`, `customer_id`, `pending_orders`, `updated_at` | `rank_position` | Which 3 customers have the most pending orders? |
+
+#### Operational Tables
+
+| Table | Columns | PK | Description |
+|---|---|---|---|
+| `pipeline_watermark` | `stream_name`, `kafka_topic`, `kafka_partition`, `kafka_offset`, `source_ts_ms`, `source_lsn`, `event_ts`, `updated_at` | `(stream_name, kafka_partition)` | Tracks per-partition progress; guards against stale watermark updates via LSN comparison |
+| `reconciliation_audit` | `audit_id` (serial), `check_name`, `window_start`, `window_end`, `source_value`, `target_value`, `status`, `detected_at`, `resolved_at`, `details` | `audit_id` | Records consistency check results between source and target |
+
+---
+
+## Quick start
 
 ```bash
+# 1. Build and start the stack
 docker compose up -d --build
-```
 
-2. Register Debezium connector (if not already done by startup)
+# 2. Register the Debezium connector
+docker compose run --rm debezium-init
 
-```bash
-docker compose logs debezium-init
-```
-
-3. Run Spark pipeline
-
-```bash
+# 3. Run the streaming pipeline
 ./scripts/run_pipeline.sh
-```
 
-This is a streaming job, so it is expected to keep running (it does not exit on success).
-To start it in background mode:
-
-```bash
-./scripts/run_pipeline.sh --detach
-```
-
-Useful commands:
-
-```bash
-docker compose logs -f spark
-docker compose restart spark
-```
-
-The runner pre-creates required Kafka topics to avoid startup race conditions between Debezium and Spark.
-
-Spark is deployed inside Docker and runs against mounted code in `/workspace`.
-
-For Git Bash on Windows, disable path conversion for docker exec commands:
-
-```bash
-export MSYS_NO_PATHCONV=1
-export MSYS2_ARG_CONV_EXCL="*"
-```
-
-The provided scripts already set these variables automatically.
-
-Windows line endings note:
-
-- The repository enforces LF for shell scripts via `.gitattributes` (`*.sh text eol=lf`).
-- If you already cloned before this rule, normalize once:
-
-```bash
-git add --renormalize .
-git status
-```
-
-If `spark-submit` is not found in the container, rebuild the Spark image:
-
-```bash
-docker compose build spark
-docker compose up -d
-```
-
-Spark Kafka connector dependencies are baked into the Spark image during build from Maven downloads, so runtime does not depend on Ivy package resolution.
-
-## Query Required Metrics
-
-Run any of the following:
-
-```bash
+# 4. (Optional) query metrics
 ./scripts/query_metrics.sh open_orders_by_delivery_status
 ./scripts/query_metrics.sh top3_delivery_dates
 ./scripts/query_metrics.sh pending_items_by_product
 ./scripts/query_metrics.sh top3_customers_pending_orders
+
+# 5. (Optional) start the PySpark notebook
+./scripts/start_notebook.sh
+# Open http://localhost:8888/?token=deel
 ```
 
-You can also run all SQLs from `spark-app/sql/metrics.sql`.
+The Spark `run_pipeline.sh` command uses `--packages` to download the required
+JVM connectors (Kafka, Delta, Postgres JDBC) at runtime. The first run may take
+a few minutes to fetch them; they are cached in `/tmp/ivy-cache` inside the
+container.
 
-## Spark Deployment Notes
+`run_pipeline.sh` pre-creates Kafka topics so Spark and Debezium never race.
 
-- Spark service mounts the current folder with:
-  - `${PWD}:/workspace`
-  - `${PWD}/.spark-checkpoints:/workspace/.spark-checkpoints`
-- This allows editing code locally without rebuilding the Spark image.
-- Streaming checkpoints persist locally in `.spark-checkpoints/`.
+## Streaming semantics
 
 - `startingOffsets=earliest` ensures nothing is missed on first run.
 - Each micro-batch is deduplicated by entity key using
   `source_lsn DESC, source_ts_ms DESC, kafka_offset DESC`.
-- Silver tables are append-only CDC logs, partitioned by `event_date`, with Delta CDF enabled.
-- Compact current-state tables (one row per entity) are maintained by consuming silver CDF
-  via `MERGE` with ordering guard.
-- Marts are computed from bounded current-state tables — no full silver scan per batch.
-- All ops metadata (processed offsets, Kafka high-water, CDC progress, reconciliation, recovery audit)
-  lives in `data/delta/ops/*` as Delta tables, not in Postgres.
-- Postgres serves only the final analytics serving layer (`analytics.{dim,fact,mart}_*`).
+- Delta `MERGE` rejects stale records and applies deletes (`op='d'`).
+- Marts are recomputed inside Spark and overwritten to Postgres on every
+  micro-batch.
 
-## Recovery
+## Scalability roadmap
 
-When Kafka topics break or offsets/partitions are lost, use `scripts/recover_stream.sh`:
+See [`OPTIMIZATION_SUMMARY.md`](OPTIMIZATION_SUMMARY.md) for a detailed analysis
+of billion-row-scale bottlenecks and the planned adaptations (current-state
+compaction, incremental marts, hourly snapshots, recovery modes A/B/C, and
+health monitoring). Ongoing work is tracked in the
+[`feature/spark_streaming_process`](https://github.com/GuilhermeMatsumoto/deel-data-engineering-task/tree/feature/spark_streaming_process)
+branch.
 
-```bash
-# Preview recovery plan (dry-run)
-./scripts/recover_stream.sh operations.customers --mode A
-
-# Execute snapshot-based recovery
-./scripts/recover_stream.sh operations.orders --mode B --apply
-
-# Partition reset (wipes checkpoint, restores snapshot)
-./scripts/recover_stream.sh operations.order_items --mode C --apply
-```
-
-Three recovery modes (all run a replication slot health pre-check before proceeding):
-
-| Mode | Description | When to use |
-|---|---|---|
-| **A** Catch-up replay | Resume from last checkpoint; idempotent MERGE | Default — minor lag |
-| **B** Snapshot + replay | Restore hourly snapshot; replay Kafka from snapshot offset; verifies LSN gap vs replication slot | Topic lost / retention expiry |
-| **C** Partition reset | Wipe checkpoint + restore snapshot + replay from earliest | `failOnDataLoss` would have thrown |
-
-## Health monitoring
-
-```bash
-# Full drift report (CDC lag, Kafka lag, reconciliation)
-./scripts/query_metrics.sh --drift
-
-# Run health cycle once
-./scripts/run_health.sh
-
-# View all ops tables
-docker compose exec spark spark-sql \
-  --packages io.delta:delta-spark_2.12:3.2.0 \
-  --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
-  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
-  -f /workspace/spark-app/sql/health_views.sql
-```
-
-- Confirm Debezium topics are receiving events.
-- Confirm Spark process is running and consuming continuously.
-- Validate records in:
-  - `analytics.fact_orders_current`
-  - `analytics.fact_order_items_current`
-  - all four `analytics.mart_*` tables
-- Update source tables and verify near-real-time reflection in marts.
+## Development
 
 Spark code is bind-mounted from the repository, so edits take effect without an
-image rebuild.  Checkpoints live in `.spark-checkpoints/`, Delta tables in
-`data/delta/` (silver, current, snapshots, ops), and Postgres data in Docker volumes.
+image rebuild.  Checkpoints live in `.spark-checkpoints/` and Delta tables in
+`data/delta/`.
 
-- Spark job logs and Spark UI screenshots
-- Sample rows from fact/mart tables
-- Before/after screenshots of metrics after source updates
+## Notebooks
 
-## Useful Commands
+A sample notebook at `notebooks/exploration.ipynb` demonstrates:
+
+- Creating a `SparkSession` with Delta support
+- Reading a Kafka CDC topic
+- Reading Delta silver tables
+- Querying Postgres final tables via JDBC
+
+## Best practices
+
+### Medallion Architecture (Bronze → Silver → Gold)
+
+The pipeline follows the medallion architecture pattern:
+- **Bronze** (raw data): Kafka topics with raw Debezium JSON
+- **Silver** (cleaned, enriched): Append-only Delta Lake tables with normalized schemas, CDC metadata, and deduplication
+- **Gold** (aggregated, serving): Postgres dimension/fact tables and pre-computed marts
+
+This layered approach enables auditing, replay, and incremental processing without reprocessing raw data.
+
+### Event Ordering with LSN Chain
+
+| Layer | Protection | Mechanism |
+|---|---|---|
+| Kafka consumer | `failOnDataLoss=false` | Gracefully handles missing offsets |
+| Batch dedupe | `dedupe_batch_by_event()` | Removes duplicate `(kafka_partition, kafka_offset)` |
+| Silver append | Append-only, no updates | Every event preserved; never overwritten |
+| Latest-by-key | `source_lsn DESC, source_ts_ms DESC, kafka_offset DESC` | Window function picks dominant event |
+| Watermark upsert | LSN comparison guard | Rejects stale watermark writes to Postgres |
+
+Postgres LSN is monotonic, persistent in WAL, and propagated untouched by Debezium, making it the ideal ordering key.
+
+### Idempotent Streaming
+
+- **At-least-once delivery** is handled via deduplication on `(kafka_partition, kafka_offset)`
+- **Bootstrap + CDC** are merged via append; the initial `op='r'` records coexist with subsequent CDC events
+- **Same LSN replayed** (e.g., after topic recreation) is rejected at the latest-by-key window because LSNs match
+
+### Concurrency Safety
+
+| Concern | Solution |
+|---|---|
+| Multiple streams refreshing Postgres simultaneously | `pg_advisory_xact_lock(424242)` — Postgres advisory lock serializes final layer writes |
+| Partial batch failures | `foreachBatch` with checkpointing — Spark resumes from last committed offset |
+| Empty batch guard | `_batch_is_empty()` check skips processing when no data |
+| Delta table existence | `ensure_silver_tables()` creates empty tables with pre-defined schemas before streaming starts |
+
+### Bootstrap Pattern
+
+Before CDC streaming begins, the pipeline performs a **one-time JDBC read** of all source tables:
+- Adds `op='r'` (read) to distinguish bootstrap records from CDC events
+- Nulls out CDC metadata fields (no Kafka provenance for bootstrap data)
+- Appends to the same Delta tables as CDC data, keeping the full history in one place
+
+This avoids the dual-write problem (initial load + streaming) and provides a unified audit log.
+
+### Data Quality & Hygiene
+
+| Practice | Implementation |
+|---|---|
+| Schema enforcement | Pre-defined `StructType` schemas for all Delta tables |
+| Null handling | `fillna(-1)`, `dropna(subset=[key_col, op])` before processing |
+| Type safety | Explicit `.cast("long")`, `.cast("decimal(18,2)")`, `to_timestamp()` |
+| Date coercion | Epoch-day integers converted via `date_add(lit("1970-01-01"), days)` — avoids Postgres date parsing pitfalls |
+| Rename typos | `quanity` → `quantity` (preserves source data fidelity) |
+| Before/after coalesce | Delete events use `before` snapshot; create/update use `after` |
+
+### Operational Visibility
+
+- **Pipeline watermark**: Tracks per-stream, per-partition maximum processed LSN/offset — enables lag monitoring
+- **Reconciliation audit table**: Ready for consistency checks between source and target
+- **Value column patterns**: All mart tables include `updated_at` timestamps for freshness tracking
+
+### Configuration Externalization
+
+All infrastructure settings are configured via **environment variables** with sensible defaults in `Settings` class:
+- Kafka bootstrap servers, DB credentials, checkpoint/Delta paths, JDBC batch sizes
+- No hardcoded connection strings in application code
+- Docker Compose injects environment variables per service
+
+### Containerized & Portable
+
+- **7 Docker services** orchestrated via Docker Compose
+- **Bind-mounted code**: Spark application code mounted from host — edits take effect without rebuild
+- **Volume-persisted data**: Postgres data, checkpoints, and Delta tables survive container restarts
+- **Git Bash compatibility**: `MSYS_NO_PATHCONV=1` and `MSYS2_ARG_CONV_EXCL="*"` for Windows users
+- **CRLF protection**: `.gitattributes` enforces LF line endings for shell scripts
+
+### CDC Infrastructure Best Practices
+
+| Practice | Detail |
+|---|---|
+| WAL retention | `wal_level=logical` enables row-level change capture |
+| Non-drop slot | `slot.drop.on.stop=false` preserves replication slot across restarts |
+| Publication scope | `cdc_publication FOR ALL TABLES` captures every schema change |
+| CDC user isolation | Dedicated `cdc_user` with minimal required privileges (REPLICATION, SELECT) |
+| Heartbeat | 10-second heartbeat interval prevents slot from being dropped during idle periods |
+| REPLICA IDENTITY FULL | Ensures Debezium captures the full row state in `before`/`after` |
+| Schema-free JSON | `JsonConverter` with `schemas.enable=false` reduces Kafka message size and complexity |
+| Decimal as string | `decimal.handling.mode=string` avoids precision loss in CDC transport |
+
+### Resiliency Patterns
+
+| Concern | Mitigation |
+|---|---|
+| Pipeline crashes | Spark Structured Streaming checkpoints record precise progress per micro-batch |
+| Out-of-order events | LSN-based ordering guarantees correct event replay |
+| Data source typos | Source column `quanity` is renamed at read time |
+| Concurrent execution | Advisory lock serializes Postgres writes; Delta table writes are independent per stream |
+| Graceful degradation | Empty batches and null-safe operations (`coalesce`, `dropna`, `fillna`) prevent crashes |
+
+## Reset
 
 ```bash
-docker compose ps
-docker compose logs -f spark
-docker compose exec analytics-db psql -U analytics_user -d analytics_db -c "\dt analytics.*"
-docker compose down
+./scripts/reset.sh
 ```
 
-This clears containers, volumes, checkpoints, and all Delta data (silver, current, ops, snapshots) for a clean run.
+This clears containers, volumes, checkpoints, and Delta data for a clean run.
