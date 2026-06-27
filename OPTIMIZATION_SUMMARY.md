@@ -2,7 +2,7 @@
 
 > **Note:** This document describes both the current pipeline implementation and the planned optimizations
 > for billion-row scale. Ongoing work is tracked in the
-> [`feature/spark_streaming_process`](https://github.com/GuilhermeMatsumoto/deel-data-engineering-task/tree/feature/spark_streaming_process)
+> [`feature/spark_streaming_process`](https://github.com/Guilhermekmts/deel-data-engineering-task/tree/feature/spark_streaming_process)
 > branch, which already covers several of the optimizations and edge cases discussed below.
 > The current `main` branch contains the fully working baseline pipeline.
 
@@ -346,7 +346,7 @@ All health data stored in `data/delta/ops/` (Delta tables, no Postgres dependenc
 
 ## Work in Progress — `feature/spark_streaming_process` Branch
 
-The [`feature/spark_streaming_process`](https://github.com/GuilhermeMatsumoto/deel-data-engineering-task/tree/feature/spark_streaming_process) branch contains ongoing work that already addresses several of the optimizations and edge cases described in this document:
+The [`feature/spark_streaming_process`](https://github.com/Guilhermekmts/deel-data-engineering-task/tree/feature/spark_streaming_process) branch contains ongoing work that already addresses several of the optimizations and edge cases described in this document:
 
 | Optimization / Edge Case | Status in Branch |
 |---|---|
