@@ -40,29 +40,6 @@ CREATE TABLE IF NOT EXISTS analytics.fact_order_items_current (
     created_at TIMESTAMP(3)
 );
 
-CREATE TABLE IF NOT EXISTS analytics.fact_orders_history (
-    event_id BIGSERIAL PRIMARY KEY,
-    order_id BIGINT NOT NULL,
-    customer_id BIGINT,
-    order_date DATE,
-    delivery_date DATE,
-    status VARCHAR(50),
-    op CHAR(1) NOT NULL,
-    event_ts TIMESTAMP(3),
-    ingested_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS analytics.fact_order_items_history (
-    event_id BIGSERIAL PRIMARY KEY,
-    order_item_id BIGINT NOT NULL,
-    order_id BIGINT,
-    product_id BIGINT,
-    quantity INTEGER,
-    op CHAR(1) NOT NULL,
-    event_ts TIMESTAMP(3),
-    ingested_at TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE TABLE IF NOT EXISTS analytics.mart_open_orders_by_delivery_status (
     delivery_date DATE NOT NULL,
     status VARCHAR(50) NOT NULL,

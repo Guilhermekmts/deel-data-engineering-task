@@ -26,6 +26,26 @@ class Settings:
     checkpoint_root = os.getenv("CHECKPOINT_ROOT", "/workspace/.spark-checkpoints")
 
     @classmethod
+    def ops_root(cls) -> str:
+        return f"{cls.delta_root}/ops"
+
+    @classmethod
+    def current_customers_path(cls) -> str:
+        return f"{cls.delta_root}/current/customers"
+
+    @classmethod
+    def current_products_path(cls) -> str:
+        return f"{cls.delta_root}/current/products"
+
+    @classmethod
+    def current_orders_path(cls) -> str:
+        return f"{cls.delta_root}/current/orders"
+
+    @classmethod
+    def current_order_items_path(cls) -> str:
+        return f"{cls.delta_root}/current/order_items"
+
+    @classmethod
     def source_jdbc_url(cls) -> str:
         return f"jdbc:postgresql://{cls.source_db_host}:{cls.source_db_port}/{cls.source_db_name}"
 

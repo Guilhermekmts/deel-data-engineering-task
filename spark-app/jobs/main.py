@@ -21,6 +21,12 @@ APP_ROOT = CURRENT_DIR.parent
 if str(APP_ROOT) not in sys.path:
     sys.path.insert(0, str(APP_ROOT))
 
+from common.delta_manager import (
+    _ensure_ops_dir,
+    ensure_current_state_tables,
+    ensure_silver_tables,
+    process_stream_batch,
+)
 from common.config import Settings
 from common.db_writer import (
     bootstrap_target_from_source,
@@ -249,25 +255,110 @@ def foreach_writer(writer_fn):
     return _write
 
 
-def run() -> None:
-    os.makedirs(Settings.checkpoint_root, exist_ok=True)
+def topic_stream(spark: SparkSession, topic: str) -> DataFrame:
+    return (
+        spark.readStream.format("kafka")
+        .option("kafka.bootstrap.servers", Settings.kafka_bootstrap_servers)
+        .option("subscribe", topic)
+        .option("startingOffsets", "earliest")
+        .option("failOnDataLoss", "false")
+        .load()
+        .select(
+            col("value").cast("string").alias("json_value"),
+            col("topic").alias("kafka_topic"),
+            col("partition").alias("kafka_partition"),
+            col("offset").alias("kafka_offset"),
+        )
+    )
 
-    source_cfg = {
-        "host": Settings.source_db_host,
-        "port": Settings.source_db_port,
-        "dbname": Settings.source_db_name,
+
+def bootstrap_with_spark(spark: SparkSession) -> None:
+    """Initial load from source DB into Delta silver tables using Spark JDBC."""
+    source_props = {
         "user": Settings.source_db_user,
         "password": Settings.source_db_password,
-    }
-    target_cfg = {
-        "host": Settings.target_db_host,
-        "port": Settings.target_db_port,
-        "dbname": Settings.target_db_name,
-        "user": Settings.target_db_user,
-        "password": Settings.target_db_password,
+        "driver": "org.postgresql.Driver",
     }
 
-    bootstrap_target_from_source(source_cfg, target_cfg)
+    customers = (
+        spark.read.jdbc(
+            Settings.source_jdbc_url(), "operations.customers", properties=source_props
+        )
+        .withColumn("op", lit("r"))
+        .withColumn("event_ts", lit(None).cast(TimestampType()))
+        .withColumn("event_date", lit(None).cast(DateType()))
+        .withColumn("source_ts_ms", lit(None).cast(LongType()))
+        .withColumn("source_lsn", lit(None).cast(LongType()))
+        .withColumn("kafka_topic", lit(None).cast(StringType()))
+        .withColumn("kafka_partition", lit(None).cast(IntegerType()))
+        .withColumn("kafka_offset", lit(None).cast(LongType()))
+    )
+    from common.delta_manager import SILVER_CUSTOMER_SCHEMA
+    customers = customers.select([f.name for f in SILVER_CUSTOMER_SCHEMA.fields])
+
+    products = (
+        spark.read.jdbc(
+            Settings.source_jdbc_url(), "operations.products", properties=source_props
+        )
+        .withColumn("unity_price", col("unity_price").cast("decimal(18,2)"))
+        .withColumn("op", lit("r"))
+        .withColumn("event_ts", lit(None).cast(TimestampType()))
+        .withColumn("event_date", lit(None).cast(DateType()))
+        .withColumn("source_ts_ms", lit(None).cast(LongType()))
+        .withColumn("source_lsn", lit(None).cast(LongType()))
+        .withColumn("kafka_topic", lit(None).cast(StringType()))
+        .withColumn("kafka_partition", lit(None).cast(IntegerType()))
+        .withColumn("kafka_offset", lit(None).cast(LongType()))
+    )
+    from common.delta_manager import SILVER_PRODUCT_SCHEMA
+    products = products.select([f.name for f in SILVER_PRODUCT_SCHEMA.fields])
+
+    orders = (
+        spark.read.jdbc(
+            Settings.source_jdbc_url(), "operations.orders", properties=source_props
+        )
+        .withColumn("op", lit("r"))
+        .withColumn("event_ts", lit(None).cast(TimestampType()))
+        .withColumn("event_date", lit(None).cast(DateType()))
+        .withColumn("source_ts_ms", lit(None).cast(LongType()))
+        .withColumn("source_lsn", lit(None).cast(LongType()))
+        .withColumn("kafka_topic", lit(None).cast(StringType()))
+        .withColumn("kafka_partition", lit(None).cast(IntegerType()))
+        .withColumn("kafka_offset", lit(None).cast(LongType()))
+    )
+    from common.delta_manager import SILVER_ORDER_SCHEMA
+    orders = orders.select([f.name for f in SILVER_ORDER_SCHEMA.fields])
+
+    order_items = (
+        spark.read.jdbc(
+            Settings.source_jdbc_url(), "operations.order_items", properties=source_props
+        )
+        .withColumnRenamed("quanity", "quantity")
+        .withColumn("op", lit("r"))
+        .withColumn("event_ts", lit(None).cast(TimestampType()))
+        .withColumn("event_date", lit(None).cast(DateType()))
+        .withColumn("source_ts_ms", lit(None).cast(LongType()))
+        .withColumn("source_lsn", lit(None).cast(LongType()))
+        .withColumn("kafka_topic", lit(None).cast(StringType()))
+        .withColumn("kafka_partition", lit(None).cast(IntegerType()))
+        .withColumn("kafka_offset", lit(None).cast(LongType()))
+    )
+    from common.delta_manager import SILVER_ORDER_ITEM_SCHEMA
+    order_items = order_items.select([f.name for f in SILVER_ORDER_ITEM_SCHEMA.fields])
+
+    def merge_or_init(df: DataFrame, key_col: str, path: str) -> None:
+        df.write.format("delta").mode("append").save(path)
+
+    merge_or_init(customers, "customer_id", Settings.silver_customers_path())
+    merge_or_init(products, "product_id", Settings.silver_products_path())
+    merge_or_init(orders, "order_id", Settings.silver_orders_path())
+    merge_or_init(order_items, "order_item_id", Settings.silver_order_items_path())
+
+
+def run() -> None:
+    os.makedirs(Settings.checkpoint_root, exist_ok=True)
+    os.makedirs(Settings.delta_root, exist_ok=True)
+    os.makedirs(Settings.ops_root(), exist_ok=True)
 
     spark = (
         SparkSession.builder.appName("deel-spark-cdc-pipeline")
@@ -276,16 +367,13 @@ def run() -> None:
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    def topic_stream(topic: str, schema: StructType) -> DataFrame:
-        return (
-            spark.readStream.format("kafka")
-            .option("kafka.bootstrap.servers", Settings.kafka_bootstrap_servers)
-            .option("subscribe", topic)
-            .option("startingOffsets", "earliest")
-            .option("failOnDataLoss", "false")
-            .load()
-            .select(from_json(col("value").cast("string"), schema).alias("payload"))
-        )
+    ensure_silver_tables(spark)
+    ensure_current_state_tables(spark)
+    _ensure_ops_dir(spark)
+
+    LOGGER.info("Bootstrapping source data into Delta silver tables if needed...")
+    bootstrap_with_spark(spark)
+    LOGGER.info("Bootstrap complete.")
 
     customers_raw = topic_stream(
         "finance_db.operations.customers", debezium_schema(CUSTOMER_RECORD_SCHEMA)

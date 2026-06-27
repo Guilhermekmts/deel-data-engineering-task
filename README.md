@@ -10,7 +10,39 @@ This repository now contains a full Dockerized baseline for the DEEL Spark take-
 
 ## Architecture
 
-Data flow:
+```text
+operations.* (Postgres)
+    │
+    │ Debezium CDC
+    ▼
+Kafka topics (finance_db.operations.*)
+    │
+    │ Spark Structured Streaming
+    ▼
+Delta silver tables (partitionBy event_date, CDF enabled)
+    │
+    │ CDF stream (change data feed)
+    ▼
+Delta current/* tables (one row per entity, Z-order on entity_id)
+    │
+    │ Spark SQL / DataFrame computation
+    ▼
+Postgres analytics tables (dim/fact/mart)
+    │
+    │ JDBC
+    ▼
+PySpark notebook
+
+Delta ops layer (data/delta/ops/):
+  processed_offsets          per-batch, per-partition consumed offset
+  cdc_slot_progress          Debezium vs Postgres WAL LSN
+  kafka_topic_high_water     Kafka end-offset per (topic, partition)
+  recovery_audit             recovery-mode execution events
+  recovery_runbook_state     last-known-good checkpoint per stream
+  reconciliation_audit       aggregate-count checks (source vs target)
+  batch_metrics              inputRows/lateRows/dedupedRows per batch
+  snapshot_registry          hourly compact-state snapshot metadata
+```
 
 1. `operations.*` tables in source Postgres (`transactions-db`)
 2. Debezium connector publishes CDC events to Kafka topics
@@ -162,7 +194,56 @@ You can also run all SQLs from `spark-app/sql/metrics.sql`.
 - This allows editing code locally without rebuilding the Spark image.
 - Streaming checkpoints persist locally in `.spark-checkpoints/`.
 
-## Validation Checklist
+- `startingOffsets=earliest` ensures nothing is missed on first run.
+- Each micro-batch is deduplicated by entity key using
+  `source_lsn DESC, source_ts_ms DESC, kafka_offset DESC`.
+- Silver tables are append-only CDC logs, partitioned by `event_date`, with Delta CDF enabled.
+- Compact current-state tables (one row per entity) are maintained by consuming silver CDF
+  via `MERGE` with ordering guard.
+- Marts are computed from bounded current-state tables — no full silver scan per batch.
+- All ops metadata (processed offsets, Kafka high-water, CDC progress, reconciliation, recovery audit)
+  lives in `data/delta/ops/*` as Delta tables, not in Postgres.
+- Postgres serves only the final analytics serving layer (`analytics.{dim,fact,mart}_*`).
+
+## Recovery
+
+When Kafka topics break or offsets/partitions are lost, use `scripts/recover_stream.sh`:
+
+```bash
+# Preview recovery plan (dry-run)
+./scripts/recover_stream.sh operations.customers --mode A
+
+# Execute snapshot-based recovery
+./scripts/recover_stream.sh operations.orders --mode B --apply
+
+# Partition reset (wipes checkpoint, restores snapshot)
+./scripts/recover_stream.sh operations.order_items --mode C --apply
+```
+
+Three recovery modes (all run a replication slot health pre-check before proceeding):
+
+| Mode | Description | When to use |
+|---|---|---|
+| **A** Catch-up replay | Resume from last checkpoint; idempotent MERGE | Default — minor lag |
+| **B** Snapshot + replay | Restore hourly snapshot; replay Kafka from snapshot offset; verifies LSN gap vs replication slot | Topic lost / retention expiry |
+| **C** Partition reset | Wipe checkpoint + restore snapshot + replay from earliest | `failOnDataLoss` would have thrown |
+
+## Health monitoring
+
+```bash
+# Full drift report (CDC lag, Kafka lag, reconciliation)
+./scripts/query_metrics.sh --drift
+
+# Run health cycle once
+./scripts/run_health.sh
+
+# View all ops tables
+docker compose exec spark spark-sql \
+  --packages io.delta:delta-spark_2.12:3.2.0 \
+  --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
+  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
+  -f /workspace/spark-app/sql/health_views.sql
+```
 
 - Confirm Debezium topics are receiving events.
 - Confirm Spark process is running and consuming continuously.
@@ -172,7 +253,9 @@ You can also run all SQLs from `spark-app/sql/metrics.sql`.
   - all four `analytics.mart_*` tables
 - Update source tables and verify near-real-time reflection in marts.
 
-## Suggested Evidence to Capture
+Spark code is bind-mounted from the repository, so edits take effect without an
+image rebuild.  Checkpoints live in `.spark-checkpoints/`, Delta tables in
+`data/delta/` (silver, current, snapshots, ops), and Postgres data in Docker volumes.
 
 - Spark job logs and Spark UI screenshots
 - Sample rows from fact/mart tables
@@ -186,3 +269,5 @@ docker compose logs -f spark
 docker compose exec analytics-db psql -U analytics_user -d analytics_db -c "\dt analytics.*"
 docker compose down
 ```
+
+This clears containers, volumes, checkpoints, and all Delta data (silver, current, ops, snapshots) for a clean run.

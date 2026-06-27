@@ -104,6 +104,79 @@ services:
       - CHECKPOINT_ROOT=/workspace/.spark-checkpoints
     command: ["sleep", "infinity"]
 
+  health-watcher:
+    build:
+      context: .
+      dockerfile: ./docker/spark/Dockerfile
+    depends_on:
+      - kafka
+      - spark
+      - transactions-db
+      - analytics-db
+    working_dir: /workspace
+    volumes:
+      - "${PWD}:/workspace"
+      - "${PWD}/.spark-checkpoints:/workspace/.spark-checkpoints"
+      - "${PWD}/data/delta:/workspace/data/delta"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - SOURCE_DB_HOST=transactions-db
+      - SOURCE_DB_PORT=5432
+      - SOURCE_DB_NAME=finance_db
+      - SOURCE_DB_USER=finance_db_user
+      - SOURCE_DB_PASSWORD=1234
+      - TARGET_DB_HOST=analytics-db
+      - TARGET_DB_PORT=5432
+      - TARGET_DB_NAME=analytics_db
+      - TARGET_DB_USER=analytics_user
+      - TARGET_DB_PASSWORD=analytics_1234
+      - CHECKPOINT_ROOT=/workspace/.spark-checkpoints
+      - DELTA_ROOT=/workspace/data/delta
+    command: >
+      sh -c "
+        while true; do
+          echo 'Running health checks...'
+          /workspace/scripts/run_health.sh;
+          echo 'Sleeping 60 seconds...';
+          sleep 60;
+        done
+      "
+
+  snapshot-runner:
+    build:
+      context: .
+      dockerfile: ./docker/spark/Dockerfile
+    depends_on:
+      - spark
+    working_dir: /workspace
+    volumes:
+      - "${PWD}:/workspace"
+      - "${PWD}/.spark-checkpoints:/workspace/.spark-checkpoints"
+      - "${PWD}/data/delta:/workspace/data/delta"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - SOURCE_DB_HOST=transactions-db
+      - SOURCE_DB_PORT=5432
+      - SOURCE_DB_NAME=finance_db
+      - SOURCE_DB_USER=finance_db_user
+      - SOURCE_DB_PASSWORD=1234
+      - TARGET_DB_HOST=analytics-db
+      - TARGET_DB_PORT=5432
+      - TARGET_DB_NAME=analytics_db
+      - TARGET_DB_USER=analytics_user
+      - TARGET_DB_PASSWORD=analytics_1234
+      - CHECKPOINT_ROOT=/workspace/.spark-checkpoints
+      - DELTA_ROOT=/workspace/data/delta
+    command: >
+      sh -c "
+        while true; do
+          echo 'Taking hourly snapshots...'
+          /workspace/scripts/run_snapshots.sh;
+          echo 'Sleeping 3600 seconds...';
+          sleep 3600;
+        done
+      "
+
 volumes:
   pg-data:
   analytics-pg-data:
