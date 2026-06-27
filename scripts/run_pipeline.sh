@@ -30,6 +30,8 @@ done
 if [[ "$detach_mode" == "--detach" ]]; then
   docker compose exec -d spark spark-submit \
     --master local[*] \
+    --driver-memory 4g \
+    --conf spark.driver.memory=4g \
     --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.2.0,org.postgresql:postgresql:42.7.3 \
     --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
     --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
@@ -42,6 +44,8 @@ if [[ "$detach_mode" == "--detach" ]]; then
 else
   docker compose exec spark spark-submit \
     --master local[*] \
+    --driver-memory 4g \
+    --conf spark.driver.memory=4g \
     --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,io.delta:delta-spark_2.12:3.2.0,org.postgresql:postgresql:42.7.3 \
     --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
     --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \

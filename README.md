@@ -63,6 +63,7 @@ flowchart TB
     subgraph EXPLORATION["Interactive"]
         NB["Jupyter Notebook\n(PySpark exploration)"]
         Q["CLI Queries\n(scripts/query_metrics.sh)"]
+        DASH["Streamlit Dashboard\n(visual analytics)"]
     end
 
     PG --> WAL
@@ -90,6 +91,7 @@ flowchart TB
     M1 & M2 & M3 & M4 & DIM_CUST & DIM_PROD & FACT_ORD & FACT_ITEMS --> ANALYTICS
     ANALYTICS --> NB
     ANALYTICS --> Q
+    ANALYTICS --> DASH
 ```
 
 ### Why Delta?
@@ -97,6 +99,8 @@ flowchart TB
 Delta Lake provides ACID merge semantics so each micro-batch can safely upsert
 the latest CDC state.  The ordering key `source_lsn > source_ts_ms > kafka_offset`
 guarantees that **late or replayed CDC events never overwrite newer state**.
+
+![Database Diagram](images/database-diagram.png)
 
 ---
 
@@ -199,6 +203,8 @@ Common CDC metadata columns appended to every silver table:
 
 Each table also carries its domain columns (e.g., `customer_id`, `customer_name`, etc.).
 
+![Delta Silver Layer Data](images/delta_data.png)
+
 ### Serving Layer — Postgres `analytics` Schema
 
 #### Dimension Tables
@@ -230,6 +236,8 @@ Each table also carries its domain columns (e.g., `customer_id`, `customer_name`
 |---|---|---|---|
 | `pipeline_watermark` | `stream_name`, `kafka_topic`, `kafka_partition`, `kafka_offset`, `source_ts_ms`, `source_lsn`, `event_ts`, `updated_at` | `(stream_name, kafka_partition)` | Tracks per-partition progress; guards against stale watermark updates via LSN comparison |
 | `reconciliation_audit` | `audit_id` (serial), `check_name`, `window_start`, `window_end`, `source_value`, `target_value`, `status`, `detected_at`, `resolved_at`, `details` | `audit_id` | Records consistency check results between source and target |
+
+![Fact and Dimension Tables](images/fact_dim_data.png)
 
 ---
 
@@ -397,6 +405,50 @@ All infrastructure settings are configured via **environment variables** with se
 | Data source typos | Source column `quanity` is renamed at read time |
 | Concurrent execution | Advisory lock serializes Postgres writes; Delta table writes are independent per stream |
 | Graceful degradation | Empty batches and null-safe operations (`coalesce`, `dropna`, `fillna`) prevent crashes |
+
+### Driver Memory Configuration
+
+The `spark-submit` command in `scripts/run_pipeline.sh` passes `--driver-memory 4g`.
+
+**Why**: In `local[*]` mode, the Spark driver and executor share a single JVM.
+The default 1 GB is insufficient when the pipeline runs four concurrent
+streaming queries — each holding Kafka consumer state, Delta transaction logs,
+and Postgres JDBC connections — causing the JVM to be silently OOM-killed by
+the OS. 4 GB provides adequate headroom for the steady-state workload.
+
+### Postgres Connection Management
+
+The `db_connection()` helper in `delta_manager.py` passes `keepalives=1`,
+`keepalives_idle=30`, `keepalives_interval=5`, and `keepalives_count=5` to
+`psycopg2.connect()`.
+
+**Why**: The advisory lock must be held across all 8 JDBC table writes to
+prevent concurrent streams from racing. The original TRUNCATE-based writes
+took `AccessExclusiveLock`, which blocked the dashboard's concurrent
+`SELECT` queries (and vice versa). Replaced with `DELETE` (which takes
+`RowExclusiveLock` — compatible with concurrent `SELECT`s) followed by
+`mode("append")` JDBC writes. TCP keepalives prevent the psycopg2
+connection from being dropped during the write window.
+
+## Monitoring
+
+### Spark UI
+
+Access the Spark UI at `http://localhost:4040` to monitor streaming query progress, batch durations, and task metrics.
+
+![Spark UI](images/spark-ui.png)
+
+### Streamlit Dashboard
+
+A Streamlit dashboard is available at `http://localhost:8501` for visualizing analytics data.
+
+![Streamlit Dashboard](images/streamlit_run.png)
+
+### CLI Queries
+
+Query analytics tables directly via `scripts/query_metrics.sh`.
+
+![CLI Query](images/cli_postgres_query.png)
 
 ## Reset
 

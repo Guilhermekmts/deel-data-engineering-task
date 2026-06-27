@@ -91,6 +91,7 @@ services:
       - "${PWD}/data/delta:/workspace/data/delta"
     ports:
       - "8888:8888"
+      - "4040:4040"
     environment:
       - SPARK_MODE=client
       - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
@@ -107,6 +108,24 @@ services:
       - CHECKPOINT_ROOT=/workspace/.spark-checkpoints
       - DELTA_ROOT=/workspace/data/delta
     command: ["sleep", "infinity"]
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: ./docker/streamlit/Dockerfile
+    depends_on:
+      - analytics-db
+    ports:
+      - "8501:8501"
+    volumes:
+      - "${PWD}/data/delta:/data/delta"
+    environment:
+      - DB_HOST=analytics-db
+      - DB_PORT=5432
+      - DB_NAME=analytics_db
+      - DB_USER=analytics_user
+      - DB_PASSWORD=analytics_1234
+      - DELTA_ROOT=/data/delta
 
 volumes:
   pg-data:

@@ -52,7 +52,10 @@ def write_final_table(df: DataFrame, table: str) -> None:
 
 @contextmanager
 def db_connection(host: str, port: str, dbname: str, user: str, password: str):
-    conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password)
+    conn = psycopg2.connect(
+        host=host, port=port, dbname=dbname, user=user, password=password,
+        keepalives=1, keepalives_idle=30, keepalives_interval=5, keepalives_count=5,
+    )
     try:
         yield conn
     finally:

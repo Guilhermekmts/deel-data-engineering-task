@@ -18,6 +18,7 @@ from common.delta_manager import (
 from common.config import Settings
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import col, date_add, get_json_object, lit, to_timestamp, when
+from pyspark.sql.streaming import StreamingQueryListener
 from pyspark.sql.types import (
     DateType,
     IntegerType,
@@ -259,6 +260,18 @@ def run() -> None:
     )
     spark.sparkContext.setLogLevel("WARN")
 
+    class LoggingListener(StreamingQueryListener):
+        def onQueryStarted(self, event):
+            LOGGER.info("[%s] query started", event.name)
+        def onQueryProgress(self, event):
+            pass
+        def onQueryTerminated(self, event):
+            if event.exception:
+                LOGGER.error("[%s] query FAILED: %s", event.name, event.exception)
+            else:
+                LOGGER.info("[%s] query stopped gracefully", event.name)
+    spark.streams.addListener(LoggingListener())
+
     ensure_silver_tables(spark)
 
     LOGGER.info("Bootstrapping source data into Delta silver tables if needed...")
@@ -311,6 +324,18 @@ def run() -> None:
     )
 
     spark.streams.awaitAnyTermination()
+
+    for q, name in [
+        (customer_query, "customers"),
+        (product_query, "products"),
+        (orders_query, "orders"),
+        (items_query, "order_items"),
+    ]:
+        exception = q.exception()
+        if exception:
+            LOGGER.error("[%s] stream terminated with exception: %s", name, exception)
+        else:
+            LOGGER.info("[%s] stream stopped (no exception)", name)
 
     customer_query.stop()
     product_query.stop()
