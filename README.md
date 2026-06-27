@@ -300,9 +300,7 @@ image rebuild.  Checkpoints live in `.spark-checkpoints/` and Delta tables in
 A sample notebook at `notebooks/exploration.ipynb` demonstrates:
 
 - Creating a `SparkSession` with Delta support
-- Reading a Kafka CDC topic
 - Reading Delta silver tables
-- Querying Postgres final tables via JDBC
 
 ## Best practices
 
